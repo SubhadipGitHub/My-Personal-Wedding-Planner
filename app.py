@@ -41,6 +41,20 @@ def init(c):
         c.execute("ALTER TABLE expense_allocations ADD COLUMN allocation_value REAL")
     c.execute("UPDATE expense_allocations SET allocation_type='By Amount' WHERE allocation_type IS NULL OR TRIM(allocation_type)=''")
     c.execute("UPDATE expense_allocations SET allocation_value=allocated_amount WHERE allocation_value IS NULL")
+    exp_cols = {r[1] for r in c.execute("PRAGMA table_info(expenses)").fetchall()}
+    if "due_date" not in exp_cols:
+        c.execute("ALTER TABLE expenses ADD COLUMN due_date TEXT")
+    c.execute("UPDATE expenses SET due_date=expense_date WHERE due_date IS NULL OR TRIM(due_date)=''")
+    budget_cols = {r[1] for r in c.execute("PRAGMA table_info(budget_items)").fetchall()}
+    if "member_id" not in budget_cols:
+        c.execute("ALTER TABLE budget_items ADD COLUMN member_id INTEGER")
+    c.execute(
+        """
+        UPDATE budget_items
+        SET member_id = (SELECT id FROM members ORDER BY id LIMIT 1)
+        WHERE member_id IS NULL
+        """
+    )
     # backfill legacy single-value paid_by/for_whom into expense_people
     c.execute(
         """
@@ -227,16 +241,122 @@ def header(s):
 
 
 def overview(c, s):
-    e = q(c, 'SELECT amount,status,category FROM expenses')
-    b = q(c, 'SELECT category,allocated_amount FROM budget_items')
-    tb = float(b['allocated_amount'].sum()) if not b.empty else 0
-    te = float(e['amount'].sum()) if not e.empty else 0
-    pdv = float(e[e['status'] == 'Paid']['amount'].sum()) if not e.empty else 0
-    pnd = float(e[e['status'] == 'Pending']['amount'].sum()) if not e.empty else 0
+    mm = members_map(c)
+    names = sorted(mm.keys())
+    selected_members = st.multiselect(
+        "Overview Members Filter (multi-select)",
+        options=names,
+        default=names,
+        key="overview_member_filter_multi",
+    )
+
+    e = q(c, 'SELECT id,amount,status,category,due_date FROM expenses')
+    alloc = q(
+        c,
+        """
+        SELECT
+            ea.expense_id,
+            ea.allocated_amount,
+            e.status,
+            e.category,
+            e.due_date,
+            m.name AS member_name
+        FROM expense_allocations ea
+        JOIN expenses e ON e.id = ea.expense_id
+        LEFT JOIN members m ON m.id = ea.member_id
+        """
+    )
+    b = q(c, 'SELECT bi.category,bi.allocated_amount,m.name AS member_name FROM budget_items bi LEFT JOIN members m ON m.id=bi.member_id')
+    paid_links = q(
+        c,
+        """
+        SELECT ep.expense_id, m.name AS member_name
+        FROM expense_people ep
+        LEFT JOIN members m ON m.id = ep.member_id
+        WHERE ep.relation_type='paid_by'
+        """,
+    )
+
+    total_budget = float(b['allocated_amount'].sum()) if not b.empty else 0.0
+    use_allocation_metrics = not alloc.empty
+    if selected_members:
+        member_budget = float(b.loc[b["member_name"].isin(selected_members), "allocated_amount"].sum()) if not b.empty else 0.0
+        if use_allocation_metrics:
+            selected_alloc = alloc[alloc["member_name"].isin(selected_members)]
+        else:
+            paid_ids = set(paid_links.loc[paid_links["member_name"].isin(selected_members), "expense_id"].dropna().tolist()) if not paid_links.empty else set()
+            e = e[e["id"].isin(paid_ids)] if paid_ids else e.iloc[0:0]
+    else:
+        member_budget = 0.0
+        selected_alloc = alloc.iloc[0:0] if use_allocation_metrics else None
+        e = e.iloc[0:0]
+
+    tb = member_budget
+    if use_allocation_metrics:
+        te = float(selected_alloc['allocated_amount'].sum()) if not selected_alloc.empty else 0.0
+        pdv = float(selected_alloc[selected_alloc['status'] == 'Paid']['allocated_amount'].sum()) if not selected_alloc.empty else 0.0
+        pnd = float(selected_alloc[selected_alloc['status'] == 'Pending']['allocated_amount'].sum()) if not selected_alloc.empty else 0.0
+        total_expenses_all = float(alloc['allocated_amount'].sum()) if not alloc.empty else 0.0
+        total_pending_all = float(alloc[alloc['status'] == 'Pending']['allocated_amount'].sum()) if not alloc.empty else 0.0
+    else:
+        te = float(e['amount'].sum()) if not e.empty else 0.0
+        pdv = float(e[e['status'] == 'Paid']['amount'].sum()) if not e.empty else 0.0
+        pnd = float(e[e['status'] == 'Pending']['amount'].sum()) if not e.empty else 0.0
+        total_expenses_all = float(q(c, 'SELECT COALESCE(SUM(amount),0) AS t FROM expenses')['t'].iloc[0]) if not q(c, 'SELECT COALESCE(SUM(amount),0) AS t FROM expenses').empty else 0.0
+        total_pending_all = float(q(c, "SELECT COALESCE(SUM(amount),0) AS t FROM expenses WHERE status='Pending'")['t'].iloc[0]) if not q(c, "SELECT COALESCE(SUM(amount),0) AS t FROM expenses WHERE status='Pending'").empty else 0.0
+    budget_share = (tb / total_budget * 100.0) if total_budget > 0 else 0.0
+    expense_share = (te / total_expenses_all * 100.0) if total_expenses_all > 0 else 0.0
+    pending_share = (pnd / total_pending_all * 100.0) if total_pending_all > 0 else 0.0
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('Total Budget', cur(tb, s)); c2.metric('Total Expenses', cur(te, s)); c3.metric('Paid', cur(pdv, s)); c4.metric('Pending', cur(pnd, s))
-    if not e.empty:
-        st.plotly_chart(px.bar(e.groupby('category', as_index=False)['amount'].sum(), x='category', y='amount'), use_container_width=True)
+    c1.metric('Selected Budget', cur(tb, s), f"{budget_share:.1f}% share")
+    c2.metric('Selected Expenses', cur(te, s), f"{expense_share:.1f}% share")
+    c3.metric('Selected Pending', cur(pnd, s), f"{pending_share:.1f}% share")
+    c4.metric('Selected Paid', cur(pdv, s))
+    if use_allocation_metrics and selected_members and not selected_alloc.empty:
+        by_cat = selected_alloc.groupby('category', as_index=False)['allocated_amount'].sum()
+        st.plotly_chart(px.bar(by_cat, x='category', y='allocated_amount'), use_container_width=True)
+        pending_base = selected_alloc[selected_alloc['status'] == 'Pending'][['due_date', 'allocated_amount']].rename(columns={'allocated_amount': 'pending_amount'})
+    else:
+        if not e.empty:
+            st.plotly_chart(px.bar(e.groupby('category', as_index=False)['amount'].sum(), x='category', y='amount'), use_container_width=True)
+        pending_base = e[e['status'] == 'Pending'][['due_date', 'amount']].rename(columns={'amount': 'pending_amount'}) if not e.empty else pd.DataFrame(columns=['due_date', 'pending_amount'])
+
+    if not pending_base.empty:
+        pending_base['due_date'] = pd.to_datetime(pending_base['due_date'], errors='coerce')
+        pending_base = pending_base.dropna(subset=['due_date'])
+        if not pending_base.empty:
+            pending_base['due_month'] = pending_base['due_date'].dt.to_period('M').dt.to_timestamp()
+            month_options = sorted(pending_base['due_month'].dropna().unique().tolist())
+            default_months = month_options
+            selected_due_months = st.multiselect(
+                "Pending Due Month Filter",
+                options=month_options,
+                default=default_months,
+                format_func=lambda d: pd.Timestamp(d).strftime('%b %Y'),
+                key='overview_pending_due_month_filter',
+            )
+            if selected_due_months:
+                filtered_pending = pending_base[pending_base['due_month'].isin(selected_due_months)]
+            else:
+                filtered_pending = pending_base.iloc[0:0]
+            due_month_series = filtered_pending.groupby('due_month', as_index=False)['pending_amount'].sum().sort_values('due_month')
+            if not due_month_series.empty:
+                current_month = pd.Timestamp.now().normalize().replace(day=1)
+                max_due_month = due_month_series['due_month'].max()
+                month_axis = pd.date_range(start=current_month, end=max_due_month, freq='MS')
+                rows = []
+                for month_start in month_axis:
+                    # Amount remains pending from current month until its due month (inclusive).
+                    still_pending = float(
+                        due_month_series.loc[due_month_series['due_month'] >= month_start, 'pending_amount'].sum()
+                    )
+                    rows.append({'month': month_start, 'pending_amount': still_pending})
+                timeline_df = pd.DataFrame(rows)
+                timeline_df['month_label'] = timeline_df['month'].dt.strftime('%b %Y')
+                st.markdown('#### Pending Expense Timeline (Current Month to Due Months)')
+                fig = px.bar(timeline_df, x='month_label', y='pending_amount')
+                fig.update_layout(xaxis_title='Month', yaxis_title=f"Pending ({s['currency_code']})")
+                st.plotly_chart(fig, use_container_width=True)
 
 
 def grid_members(c):
@@ -265,22 +385,31 @@ def grid_members(c):
 
 def grid_budget(c, s):
     st.subheader('Budget Grid')
+    mm = members_map(c)
+    names = sorted(mm.keys())
     cts = cats(s.get('expense_categories', ''), SETTINGS_DEFAULTS['expense_categories'])
-    df = q(c, 'SELECT id,category,allocated_amount,notes FROM budget_items ORDER BY id DESC')
-    if df.empty: df = pd.DataFrame(columns=['id', 'category', 'allocated_amount', 'notes'])
+    df = q(c, 'SELECT bi.id,bi.category,bi.allocated_amount,m.name AS member,bi.notes FROM budget_items bi LEFT JOIN members m ON m.id=bi.member_id ORDER BY bi.id DESC')
+    if df.empty: df = pd.DataFrame(columns=['id', 'category', 'allocated_amount', 'member', 'notes'])
     grid_df, filtered_mode = apply_apex_filters(df, "budget", hidden_cols=["id"])
     ed = st.data_editor(
         grid_df,
         num_rows='dynamic',
         use_container_width=True,
         key='bgrid',
-        column_config={'id': None, 'category': st.column_config.SelectboxColumn(options=cts)},
+        column_config={
+            'id': None,
+            'category': st.column_config.SelectboxColumn(options=cts),
+            'member': st.column_config.SelectboxColumn(options=names),
+        },
     )
     if st.button('Save Budget Grid'):
-        ok = upsert_grid(c, 'budget_items', ed, ['category', 'allocated_amount', 'notes'], [
+        ed2 = ed.copy()
+        ed2["member_id"] = ed2["member"]
+        ok = upsert_grid(c, 'budget_items', ed2, ['category', 'member_id', 'allocated_amount', 'notes'], [
             lambda r: 'Budget category invalid' if r.get('category') not in cts else None,
+            lambda r: 'Budget member required' if not r.get('member_id') else None,
             lambda r: 'Allocated amount must be > 0' if float(r.get('allocated_amount') or 0) <= 0 else None,
-        ], delete_missing=not filtered_mode)
+        ], map_in={'member_id': mm}, delete_missing=not filtered_mode)
         if ok: st.success('Saved'); st.rerun()
 
 
@@ -290,9 +419,9 @@ def grid_expenses(c, s):
     names = sorted(mm.keys())
     id_to_name = {v: k for k, v in mm.items()}
     cts = cats(s.get('expense_categories', ''), SETTINGS_DEFAULTS['expense_categories'])
-    df = q(c, '''SELECT id,expense_date,title,category,amount,paid_by,status,for_whom,bill_link,email_ref,notes FROM expenses ORDER BY expense_date DESC,id DESC''')
+    df = q(c, '''SELECT id,expense_date,due_date,title,category,amount,paid_by,status,bill_link,email_ref,notes FROM expenses ORDER BY expense_date DESC,id DESC''')
     if df.empty:
-        df = pd.DataFrame(columns=['id', 'expense_date', 'title', 'category', 'amount', 'paid_by', 'status', 'for_whom', 'bill_link', 'email_ref', 'notes'])
+        df = pd.DataFrame(columns=['id', 'expense_date', 'due_date', 'title', 'category', 'amount', 'paid_by', 'status', 'bill_link', 'email_ref', 'notes'])
     else:
         participants = q(
             c,
@@ -317,19 +446,16 @@ def grid_expenses(c, s):
             lambda r: paid_map.get(int(r["id"]), [id_to_name[r["paid_by"]]] if pd.notna(r["paid_by"]) and r["paid_by"] in id_to_name else []),
             axis=1,
         )
-        df["for_whom"] = df.apply(
-            lambda r: whom_map.get(int(r["id"]), [id_to_name[r["for_whom"]]] if pd.notna(r["for_whom"]) and r["for_whom"] in id_to_name else []),
-            axis=1,
-        )
         df['expense_date'] = pd.to_datetime(df['expense_date'], errors='coerce')
+        df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce')
     grid_df, filtered_mode = apply_apex_filters(df, "expenses", hidden_cols=["id"])
     ed = st.data_editor(grid_df, num_rows='dynamic', use_container_width=True, key='egrid', column_config={
         'id': None,
         'expense_date': st.column_config.DateColumn(format='YYYY-MM-DD'),
+        'due_date': st.column_config.DateColumn(format='YYYY-MM-DD'),
         'category': st.column_config.SelectboxColumn(options=cts),
         'paid_by': st.column_config.MultiselectColumn(options=names),
         'status': st.column_config.SelectboxColumn(options=['Paid', 'Pending']),
-        'for_whom': st.column_config.MultiselectColumn(options=names),
     })
     def v1(r): return 'Expense title required' if not r.get('title') else None
     def v2(r): return 'Expense category invalid' if r.get('category') not in cts else None
@@ -347,15 +473,14 @@ def grid_expenses(c, s):
         if blank(r.get('expense_date')): return 'Expense date required'
         if pd.isna(pd.to_datetime(r.get('expense_date'), errors='coerce')): return 'Expense date invalid'
         return None
-    def v7(r):
-        vals = r.get('for_whom') if isinstance(r.get('for_whom'), list) else ([r.get('for_whom')] if r.get('for_whom') else [])
-        for v in vals:
-            if v not in mm:
-                return 'For Whom invalid'
+    def v8(r):
+        if blank(r.get('due_date')): return None
+        if pd.isna(pd.to_datetime(r.get('due_date'), errors='coerce')): return 'Due date invalid'
         return None
     if st.button('Save Expenses Grid'):
         ed2 = ed.copy()
         ed2['expense_date'] = pd.to_datetime(ed2['expense_date'], errors='coerce').dt.date.astype(str)
+        ed2['due_date'] = pd.to_datetime(ed2['due_date'], errors='coerce').dt.date.astype(str).replace('NaT', None)
         ex = {r[0] for r in c.execute('SELECT id FROM expenses').fetchall()}
         keep = set()
         now = datetime.now().isoformat(timespec='seconds')
@@ -363,54 +488,52 @@ def grid_expenses(c, s):
             rid = None if blank(r.get('id')) else int(r.get('id'))
             row = {
                 'expense_date': r.get('expense_date'),
+                'due_date': None if blank(r.get('due_date')) else r.get('due_date'),
                 'title': '' if blank(r.get('title')) else str(r.get('title')).strip(),
                 'category': '' if blank(r.get('category')) else str(r.get('category')).strip(),
                 'amount': 0.0 if blank(r.get('amount')) else float(r.get('amount')),
                 'paid_by': r.get('paid_by') if isinstance(r.get('paid_by'), list) else ([] if blank(r.get('paid_by')) else [r.get('paid_by')]),
-                'for_whom': r.get('for_whom') if isinstance(r.get('for_whom'), list) else ([] if blank(r.get('for_whom')) else [r.get('for_whom')]),
                 'status': '' if blank(r.get('status')) else str(r.get('status')).strip(),
                 'bill_link': '' if blank(r.get('bill_link')) else str(r.get('bill_link')).strip(),
                 'email_ref': '' if blank(r.get('email_ref')) else str(r.get('email_ref')).strip(),
                 'notes': '' if blank(r.get('notes')) else str(r.get('notes')).strip(),
             }
-            if all([blank(row['expense_date']), not row['title'], not row['category'], row['amount'] == 0.0, not row['paid_by'], not row['for_whom'], not row['status']]):
+            if all([blank(row['expense_date']), not row['title'], not row['category'], row['amount'] == 0.0, not row['paid_by'], not row['status']]):
                 if rid is None:
                     continue
-            for fn in [v1, v2, v3, v4, v5, v6, v7]:
+            for fn in [v1, v2, v3, v4, v5, v6, v8]:
                 err = fn(row)
                 if err:
                     st.error(err)
                     return
+            if blank(row['due_date']):
+                row['due_date'] = row['expense_date']
             paid_ids = [mm[v] for v in row['paid_by'] if v in mm]
-            whom_ids = [mm[v] for v in row['for_whom'] if v in mm]
             paid_primary = paid_ids[0] if paid_ids else None
-            whom_primary = whom_ids[0] if whom_ids else None
             if rid in ex:
                 c.execute(
                     """
                     UPDATE expenses
-                    SET expense_date=?, title=?, category=?, amount=?, paid_by=?, for_whom=?, status=?, bill_link=?, email_ref=?, notes=?
+                    SET expense_date=?, due_date=?, title=?, category=?, amount=?, paid_by=?, for_whom=?, status=?, bill_link=?, email_ref=?, notes=?
                     WHERE id=?
                     """,
-                    (row['expense_date'], row['title'], row['category'], row['amount'], paid_primary, whom_primary, row['status'], row['bill_link'], row['email_ref'], row['notes'], rid),
+                    (row['expense_date'], row['due_date'], row['title'], row['category'], row['amount'], paid_primary, None, row['status'], row['bill_link'], row['email_ref'], row['notes'], rid),
                 )
                 expense_id = rid
                 keep.add(rid)
             else:
                 inserted = c.execute(
                     """
-                    INSERT INTO expenses(expense_date,title,category,amount,paid_by,for_whom,status,bill_link,email_ref,notes,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO expenses(expense_date,due_date,title,category,amount,paid_by,for_whom,status,bill_link,email_ref,notes,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (row['expense_date'], row['title'], row['category'], row['amount'], paid_primary, whom_primary, row['status'], row['bill_link'], row['email_ref'], row['notes'], now),
+                    (row['expense_date'], row['due_date'], row['title'], row['category'], row['amount'], paid_primary, None, row['status'], row['bill_link'], row['email_ref'], row['notes'], now),
                 )
                 expense_id = inserted.lastrowid
                 keep.add(expense_id)
             c.execute('DELETE FROM expense_people WHERE expense_id=?', (expense_id,))
             for pid in paid_ids:
                 c.execute('INSERT INTO expense_people(expense_id,member_id,relation_type,created_at) VALUES(?,?,?,?)', (expense_id, pid, 'paid_by', now))
-            for wid in whom_ids:
-                c.execute('INSERT INTO expense_people(expense_id,member_id,relation_type,created_at) VALUES(?,?,?,?)', (expense_id, wid, 'for_whom', now))
         if not filtered_mode:
             for did in ex - keep:
                 c.execute('DELETE FROM expenses WHERE id=?', (did,))
@@ -479,6 +602,28 @@ def grid_expenses(c, s):
         )
         if adf.empty:
             adf = pd.DataFrame(columns=['id', 'member', 'allocation_type', 'allocation_value', 'allocated_amount'])
+        if adf.empty and alloc_paid_by_selected:
+            # Seed defaults when expense has no allocation rows.
+            if alloc_type == "Single":
+                seed_members = alloc_paid_by_selected[:1]
+                seed_values = [selected_expense_amount]
+            elif alloc_type == "By Percentage":
+                seed_members = alloc_paid_by_selected
+                base_pct = round(100.0 / len(seed_members), 2)
+                seed_values = [base_pct] * len(seed_members)
+                seed_values[-1] = round(100.0 - sum(seed_values[:-1]), 2)
+            else:
+                seed_members = alloc_paid_by_selected
+                base_amt = round(selected_expense_amount / len(seed_members), 2)
+                seed_values = [base_amt] * len(seed_members)
+                seed_values[-1] = round(selected_expense_amount - sum(seed_values[:-1]), 2)
+            adf = pd.DataFrame({
+                'id': [None] * len(seed_members),
+                'member': seed_members,
+                'allocation_type': [alloc_type] * len(seed_members),
+                'allocation_value': seed_values,
+                'allocated_amount': [0.0] * len(seed_members),
+            })
         adf["allocation_type"] = alloc_type
         aed = st.data_editor(
             adf,

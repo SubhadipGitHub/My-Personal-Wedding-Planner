@@ -15,6 +15,10 @@ An interactive, local-first wedding planning app built with Streamlit + SQLite.
   - per-column filters by type (text values, number ranges, date ranges)
   - filters apply directly to the same editable grid (single-grid workflow)
 - Unified dashboard for your wedding planning progress
+- Overview multi-member filter for grouped expense tracking
+- Member-wise budget assignment with share against total budget
+- Pending expense projection chart from current month through next 12 months
+- Pending expense timeline by due month with month-level filter in Overview
 - Overall budget planning by category (venue, dress, cake, decor, etc.)
 - Expense tracking by person:
   - self
@@ -22,6 +26,7 @@ An interactive, local-first wedding planning app built with Streamlit + SQLite.
   - family members
 - Expense details with:
   - paid/pending status
+  - due date for pending planning
   - bill/document links
   - email reference notes
 - Custom expense allocation:
@@ -109,10 +114,8 @@ python -m streamlit run app.py
 
 3. Use the `Expenses` tab for every payment.
    Add title, category, amount, payment status, and optional bill/email references.
-   Use multi-select fields for `Paid By` and `For Whom` in the interactive grid.
-   Choose `Allocation Mode`:
-   - `Single person` for one beneficiary
-   - `Custom split` to divide the expense among multiple people
+   Use multi-select `Paid By` in the interactive grid.
+   Manage splits in the Allocation section by selecting an expense row and allocation type.
    Review split widgets to track total expenditure and paid vs pending percentages.
 
 4. Use `Planning` to manage work items.
