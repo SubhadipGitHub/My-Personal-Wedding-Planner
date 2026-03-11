@@ -1936,14 +1936,16 @@ def main():
         c.close()
         return
 
-    tabs = ['Overview', 'Family']
+    tabs = ['Overview']
+    if auth.get("is_admin") or auth.get("is_global_admin"):
+        tabs.append('Family')
     if can_view(auth, "budget"):
         tabs.append('Budget')
     if can_view(auth, "expenses"):
         tabs.append('Expenses')
     if can_view(auth, "plans"):
         tabs.append('Planning')
-    if auth.get("is_admin"):
+    if auth.get("is_admin") or auth.get("is_global_admin"):
         tabs.append('Settings')
 
     # Allow linking to a specific tab via query param (e.g., ?tab=Expenses)
