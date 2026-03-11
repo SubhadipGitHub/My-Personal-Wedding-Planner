@@ -2,8 +2,13 @@
 
 An interactive, local-first wedding planning app built with Streamlit + SQLite.
 
-## Features
+## Key Features
 
+- ✅ User accounts + login (admin + member access)
+- ✅ Password reset flow with expiring reset tokens
+- ✅ Last login timestamp recorded per user
+- 🧑‍🤝‍🧑 Multi-family support (each “family” is a separate data scope)
+- 🔐 Role-based access controls (global admin, family admin, member)
 - Oracle APEX-style interactive grids (no separate add forms) for:
   - People
   - Budget
@@ -65,9 +70,9 @@ An interactive, local-first wedding planning app built with Streamlit + SQLite.
 
 ## Project Files
 
-- `app.py` -> main Streamlit app
-- `requirements.txt` -> Python dependencies
-- `wedding_planner.db` -> local database (auto-created on first run)
+- `app.py` → main Streamlit app
+- `requirements.txt` → Python dependencies
+- `wedding_planner.db` → local database (auto-created on first run)
 
 ## Run Locally (Windows PowerShell)
 
@@ -104,48 +109,69 @@ python -m streamlit run app.py
 
 6. Open the local URL shown in terminal (usually `http://localhost:8501`).
 
+---
+
+## Deployment Notes (Optional)
+
+This is a local-first app; to deploy publicly you can use any Streamlit hosting service or containerized platform.
+
+### Quick deploy options
+
+- **Streamlit Community Cloud**: connect this repo and deploy (requires a GitHub repo).
+- **Docker**: build a container that runs `streamlit run app.py` and mounts a persistent volume for `wedding_planner.db`.
+- **Other PaaS** (Heroku / Azure / AWS): ensure the app has write access for the SQLite file and use an external persistent storage volume.
+
+---
+
 ## How to Use the App
 
-1. Open the app and start in the `People` tab.
-   Add yourself, your partner, and family members who will pay or manage tasks.
+### 1) Login & accounts
 
-2. Go to the `Budget` tab.
-   Add budget categories with allocated amounts. Categories are strictly taken from `Settings`.
+- On first launch, the app prompts you to create the **admin account** (`admin` / `Welcome@12345`).
+- Admins can create additional family members and grant them access.
+- Each user can log in with their username and password.
+- The app records **last login time** for every login.
+- Password reset is supported via a token that expires after 1 hour.
 
-3. Use the `Expenses` tab for every payment.
-   Add title, category, amount, payment status, and optional bill/email references.
-   Use multi-select `Paid By` in the interactive grid.
-   Manage splits in the Allocation section by selecting an expense row and allocation type.
-   Review split widgets to track total expenditure and paid vs pending percentages.
+### 2) Create Families (Members)
 
-4. Use `Planning` to manage work items.
-   Add dresses, cake bookings, event tasks, vendor follow-ups, due dates, assignees, and status.
+- Families are managed in the **People** tab.
+- Each “family” is a separate group of budget/expenses/plans.
+- Global admins can manage all families; family admins can manage only their own family.
 
-5. Monitor the `Overview` tab regularly.
-   Check total budget vs spent, category-wise spend charts, and current paid/pending totals.
+### 3) Budget
 
-6. Configure the `Settings` tab.
-   Set currency, timezone, date format, names, and your category lists to personalize the planner.
-   Use `Reset All Data` if you want to clear budgets, expenses, plans, and members while keeping settings.
+- Add categories and amounts in the **Budget** tab.
+- Assign budgets to specific family members.
+- Budget vs. spent metrics and charts are visible in the **Overview** tab.
 
-7. Update records continuously.
-   Your entries are saved automatically in `wedding_planner.db`, so reopen the app anytime and continue.
+### 4) Expenses
 
-## If `streamlit` command is not recognized
+- Use the **Expenses** tab to log expenses.
+- Track who paid, status (Paid/Pending), due dates, bill links, and notes.
+- Expenses can be split across members and tracked in the **Allocations** section.
 
-Use module mode (works reliably inside venv):
+### 5) Planning
 
-```powershell
-python -m streamlit run app.py
-```
+- Use the **Planning** tab for tasks, vendors, deliveries, event bookings, etc.
+- Set due dates, assign to members, and track status.
 
-## If PowerShell blocks venv activation
+### 6) Overview Dashboard
 
-Run this once in the same terminal session, then activate again:
+- Review overall budget vs actuals, expense trends, and pending items.
+- Filter by family and see per-member breakdowns.
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
+### 7) Settings
+
+- Customize:
+  - Currency symbol/code
+  - Timezone
+  - Date format
+  - Couple names
+  - Expense & planning categories
+- Use **Reset All Data** to clear budgets, expenses, plans, and members while keeping settings.
+
+---
 
 ## Notes
 
