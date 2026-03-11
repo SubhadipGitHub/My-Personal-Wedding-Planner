@@ -435,10 +435,16 @@ def _norm_role(role):
 def module_role(auth, module):
     if not auth:
         return "none"
-    # Family admins can edit their own family. Global admin can edit all families.
-    if auth.get("is_global_admin"):
+    # Global and family admins can edit everything.
+    if auth.get("is_global_admin") or auth.get("is_admin"):
         return "edit"
-    return "edit" if auth.get("is_admin") else "view"
+
+    # Members should be able to manage their own budget/expenses/plans.
+    # Fall back to stored role if explicitly set (e.g. "view"), otherwise default to edit.
+    role = auth.get(f"{module}_role")
+    if role in ["none", "view", "edit"]:
+        return role
+    return "edit"
 
 
 def can_view(auth, module):
