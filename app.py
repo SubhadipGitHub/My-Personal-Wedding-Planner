@@ -592,6 +592,7 @@ def login_sidebar(c):
             return None
         now = datetime.now().isoformat(timespec='seconds')
         c.execute("UPDATE user_accounts SET last_login=? WHERE id=?", (now, int(row[0])))
+        c.commit()
         st.session_state["auth_user_id"] = int(row[0])
         _persist_auth_uid(int(row[0]))
         st.rerun()
