@@ -21,7 +21,9 @@ SETTINGS_DEFAULTS = {
     'currency_symbol': 'Rs ', 'currency_code': 'INR', 'timezone': 'Asia/Kolkata',
     'date_format': '%d-%b-%Y', 'user_name': 'Me', 'partner_name': 'Partner',
     'expense_categories': 'Venue,Dress,Cake,Decor,Photography,Travel,Jewelry,Invitation,Catering,Other',
-    'planning_categories': 'Dress,Cake,Event,Vendor,Decoration,Guest Task,Other'
+    'planning_categories': 'Dress,Cake,Event,Vendor,Decoration,Guest Task,Other',
+    # CSS background value for the app (e.g., '#fff', 'linear-gradient(...)')
+    'app_background': '#f7f8fc',
 }
 st.set_page_config(page_title='Wedding Planner', page_icon=':ring:', layout='wide')
 
@@ -784,11 +786,12 @@ def header(s):
 
 
 def dashboard_card(title, value, subtitle, color, href=None):
+    # Use a consistent card style across the dashboard
     content = (
-        f"<div style='background:{color};padding:16px;border-radius:12px;box-shadow:0 2px 6px rgba(0,0,0,0.08);'>"
-        f"<div style='font-size:0.85em;color:#ffffff70;margin-bottom:4px;'>{html.escape(title)}</div>"
-        f"<div style='font-size:1.8em;font-weight:700;color:#fff;margin-bottom:6px;'>{html.escape(value)}</div>"
-        f"<div style='font-size:0.85em;color:#ffffffcc;'>{html.escape(subtitle)}</div>"
+        f"<div style='background:{color};padding:18px;border-radius:14px;box-shadow:0 4px 12px rgba(0,0,0,0.12);'>"
+        f"<div style='font-size:0.85em;color:rgba(255,255,255,0.85);margin-bottom:6px;font-weight:600;'>{html.escape(title)}</div>"
+        f"<div style='font-size:2.05em;font-weight:800;color:#ffffff;margin-bottom:8px;'>{html.escape(value)}</div>"
+        f"<div style='font-size:0.85em;color:rgba(255,255,255,0.9);'>{html.escape(subtitle)}</div>"
         "</div>"
     )
     if href:
@@ -799,64 +802,71 @@ def dashboard_card(title, value, subtitle, color, href=None):
 def overview(c, s, auth):
     mm = members_map(c)
     id_to_name = {v: k for k, v in mm.items()}
-    allowed_names = [auth["member_name"]] if auth else []
-    selected_members = st.multiselect(
-        "Overview Members Filter (multi-select)",
-        options=allowed_names,
-        default=allowed_names,
-        key="overview_member_filter_multi",
-        help="Choose members to include in the dashboard metrics.",
+
+    if auth and auth.get("is_global_admin"):
+        allowed_families = sorted(mm.keys())
+    else:
+        allowed_families = [auth["member_name"]] if auth else []
+
+    selected_families = st.multiselect(
+        "Family Filter (multi-select)",
+        options=allowed_families,
+        default=allowed_families,
+        key="overview_family_filter_multi",
+        help="Choose families to include in the dashboard metrics.",
     )
 
-    if auth:
-        e = q(c, 'SELECT id,amount,status,category,expense_date FROM expenses WHERE owner_member_id=?', (auth["member_id"],))
+    selected_ids = [mm[n] for n in selected_families if n in mm]
+    if not selected_ids:
+        e = pd.DataFrame(columns=["id", "amount", "status", "category", "expense_date"])
+        alloc = pd.DataFrame(columns=["expense_id", "allocated_amount", "status", "category", "expense_date", "member_name"])
+        b = pd.DataFrame(columns=["category", "allocated_amount", "member_name"])
+        paid_links = pd.DataFrame(columns=["expense_id", "member_name"])
     else:
-        e = q(c, 'SELECT id,amount,status,category,expense_date FROM expenses WHERE 0')
-    alloc = q(
-        c,
-        """
-        SELECT
-            ea.expense_id,
-            ea.allocated_amount,
-            e.status,
-            e.category,
-            e.expense_date,
-            m.name AS member_name
-        FROM expense_allocations ea
-        JOIN expenses e ON e.id = ea.expense_id
-        LEFT JOIN members m ON m.id = ea.member_id
-        WHERE e.owner_member_id=?
-        """,
-        (auth["member_id"],),
-    )
-    if not alloc.empty and not e.empty:
-        alloc = alloc[alloc["expense_id"].isin(e["id"].tolist())]
-    b = q(
-        c,
-        'SELECT bi.category,bi.allocated_amount,m.name AS member_name FROM budget_items bi LEFT JOIN members m ON m.id=bi.member_id WHERE owner_member_id=?',
-        (auth["member_id"],),
-    )
-    paid_links = q(
-        c,
-        """
-        SELECT ep.expense_id, m.name AS member_name
-        FROM expense_people ep
-        JOIN expenses e ON e.id = ep.expense_id
-        LEFT JOIN members m ON m.id = ep.member_id
-        WHERE ep.relation_type='paid_by' AND e.owner_member_id=?
-        """,
-        (auth["member_id"],),
-    )
+        clause, params = _in_params(selected_ids)
+        e = q(c, f"SELECT id,amount,status,category,expense_date FROM expenses WHERE owner_member_id IN {clause}", params)
+        alloc = q(
+            c,
+            f"""
+            SELECT
+                ea.expense_id,
+                ea.allocated_amount,
+                e.status,
+                e.category,
+                e.expense_date,
+                m.name AS member_name
+            FROM expense_allocations ea
+            JOIN expenses e ON e.id = ea.expense_id
+            LEFT JOIN members m ON m.id = ea.member_id
+            WHERE e.owner_member_id IN {clause}
+            """,
+            params,
+        )
+        if not alloc.empty and not e.empty:
+            alloc = alloc[alloc["expense_id"].isin(e["id"].tolist())]
+        b = q(
+            c,
+            f"SELECT bi.category,bi.allocated_amount,m.name AS member_name FROM budget_items bi LEFT JOIN members m ON m.id=bi.member_id WHERE owner_member_id IN {clause}",
+            params,
+        )
+        paid_links = q(
+            c,
+            f"""
+            SELECT ep.expense_id, m.name AS member_name
+            FROM expense_people ep
+            JOIN expenses e ON e.id = ep.expense_id
+            LEFT JOIN members m ON m.id = ep.member_id
+            WHERE ep.relation_type='paid_by' AND e.owner_member_id IN {clause}
+            """,
+            params,
+        )
 
     total_budget = float(b['allocated_amount'].sum()) if not b.empty else 0.0
     use_allocation_metrics = not alloc.empty
-    if selected_members:
-        member_budget = float(b.loc[b["member_name"].isin(selected_members), "allocated_amount"].sum()) if not b.empty else 0.0
-        if use_allocation_metrics:
-            selected_alloc = alloc[alloc["member_name"].isin(selected_members)]
-        else:
-            paid_ids = set(paid_links.loc[paid_links["member_name"].isin(selected_members), "expense_id"].dropna().tolist()) if not paid_links.empty else set()
-            e = e[e["id"].isin(paid_ids)] if paid_ids else e.iloc[0:0]
+    if selected_ids:
+        # For family filtering, include all data already scoped by owner_member_id.
+        member_budget = total_budget
+        selected_alloc = alloc if use_allocation_metrics else None
     else:
         member_budget = 0.0
         selected_alloc = alloc.iloc[0:0] if use_allocation_metrics else None
@@ -877,7 +887,11 @@ def overview(c, s, auth):
         total_pending_all = pnd
 
     # Dashboard summary cards
-    plans_df = q(c, "SELECT due_date FROM plans WHERE owner_member_id=?", (auth["member_id"],))
+    if selected_ids:
+        clause, params = _in_params(selected_ids)
+        plans_df = q(c, f"SELECT due_date FROM plans WHERE owner_member_id IN {clause}", params)
+    else:
+        plans_df = pd.DataFrame(columns=["due_date"])
     plans_df['due_date'] = pd.to_datetime(plans_df['due_date'], errors='coerce')
     upcoming_plans = int(plans_df[plans_df['due_date'] >= pd.Timestamp.now().normalize()].shape[0]) if not plans_df.empty else 0
 
@@ -921,9 +935,15 @@ def overview(c, s, auth):
 
     # Recent activity feed
     st.markdown('### Recent Activity')
-    act_expenses = q(c, "SELECT created_at, 'Expense' AS type, title AS desc FROM expenses WHERE owner_member_id=?", (auth['member_id'],))
-    act_plans = q(c, "SELECT created_at, 'Plan' AS type, title AS desc FROM plans WHERE owner_member_id=?", (auth['member_id'],))
-    act_budget = q(c, "SELECT created_at, 'Budget' AS type, category AS desc FROM budget_items WHERE owner_member_id=?", (auth['member_id'],))
+    if selected_ids:
+        clause, params = _in_params(selected_ids)
+        act_expenses = q(c, f"SELECT created_at, 'Expense' AS type, title AS desc FROM expenses WHERE owner_member_id IN {clause}", params)
+        act_plans = q(c, f"SELECT created_at, 'Plan' AS type, title AS desc FROM plans WHERE owner_member_id IN {clause}", params)
+        act_budget = q(c, f"SELECT created_at, 'Budget' AS type, category AS desc FROM budget_items WHERE owner_member_id IN {clause}", params)
+    else:
+        act_expenses = pd.DataFrame(columns=["created_at", "type", "desc"])
+        act_plans = pd.DataFrame(columns=["created_at", "type", "desc"])
+        act_budget = pd.DataFrame(columns=["created_at", "type", "desc"])
     act = pd.concat([act_expenses, act_plans, act_budget], ignore_index=True)
     if not act.empty:
         act['created_at'] = pd.to_datetime(act['created_at'], errors='coerce')
@@ -933,7 +953,7 @@ def overview(c, s, auth):
     else:
         st.write('No recent activity.')
 
-    if use_allocation_metrics and selected_members and not selected_alloc.empty:
+    if use_allocation_metrics and selected_ids and not selected_alloc.empty:
         by_cat = selected_alloc.groupby('category', as_index=False)['allocated_amount'].sum()
         st.plotly_chart(px.bar(by_cat, x='category', y='allocated_amount'), use_container_width=True)
         # Use expense_date as the reference for overdue/pending calculations (no separate due date needed).
@@ -1939,6 +1959,11 @@ def render_settings(c, s, auth):
             tz = st.text_input('Timezone', value=s['timezone'])
             dfmt = st.selectbox('Date Format', options=['%d-%b-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'], index=['%d-%b-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'].index(s['date_format']) if s['date_format'] in ['%d-%b-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'] else 0)
             plc = st.text_area('Planning Categories (comma-separated)', value=s['planning_categories'])
+            bg = st.text_input(
+                'App Background (CSS)',
+                value=s.get('app_background', SETTINGS_DEFAULTS['app_background']),
+                help='Any valid CSS background value (e.g., #fff, linear-gradient(...), or an image URL like https://.../bg.jpg).',
+            )
         ok = st.form_submit_button('Save Settings')
     if ok:
         try: ZoneInfo(tz.strip() or SETTINGS_DEFAULTS['timezone'])
@@ -1952,7 +1977,8 @@ def render_settings(c, s, auth):
             'timezone': tz.strip() or SETTINGS_DEFAULTS['timezone'],
             'date_format': dfmt,
             'expense_categories': ','.join(cats(exp, SETTINGS_DEFAULTS['expense_categories'])),
-            'planning_categories': ','.join(cats(plc, SETTINGS_DEFAULTS['planning_categories']))
+            'planning_categories': ','.join(cats(plc, SETTINGS_DEFAULTS['planning_categories'])),
+            'app_background': (bg.strip() or SETTINGS_DEFAULTS['app_background']),
         }
         save_settings(c, ns); st.success('Saved'); s = settings(c)
     st.caption(f"Current: {s['currency_symbol']} | {s['currency_code']} | {s['timezone']} | {s['date_format']}")
@@ -1971,8 +1997,36 @@ def render_settings(c, s, auth):
 
 
 def main():
-    st.markdown('<style>.stApp{background:radial-gradient(circle at top left,#fff4e6 0%,#ffe8d6 35%,#ffd7ba 100%);}</style>', unsafe_allow_html=True)
     c = db(); init(c); seed(c); s = settings(c)
+    raw_bg = (s.get('app_background', SETTINGS_DEFAULTS['app_background']) or '').strip()
+    bg_val = raw_bg
+    # Treat plain URLs or image paths as background images.
+    if bg_val and not re.search(r"\burl\s*\(", bg_val, re.IGNORECASE):
+        if re.match(r"^https?://", bg_val, re.IGNORECASE) or re.search(r"\.(png|jpe?g|gif|webp|svg)(\?.*)?$", bg_val, re.IGNORECASE):
+            bg_val = f'url("{bg_val}") center/cover no-repeat'
+
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background: {html.escape(bg_val)};
+        }}
+        .stApp .block-container {{
+            padding: 1.5rem 1.5rem 2rem;
+        }}
+        .stApp .stButton>button {{
+            border-radius: 10px;
+        }}
+        .stApp .stTextInput>div>div>input, .stApp .stTextArea>div>div>textarea {{
+            border-radius: 10px;
+        }}
+        .stApp .css-1wrcr25 {{
+            box-shadow: 0 8px 30px rgba(0,0,0,0.05);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     auth = login_sidebar(c)
     header(s)
     if not auth:
