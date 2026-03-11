@@ -75,9 +75,11 @@ def init(c):
     for col in ["budget_role", "expenses_role", "plans_role", "last_login", "reset_token", "reset_expires_at"]:
         if col not in ua_cols:
             c.execute(f"ALTER TABLE user_accounts ADD COLUMN {col} TEXT")
-    c.execute("UPDATE user_accounts SET budget_role=COALESCE(NULLIF(TRIM(budget_role),''),'view')")
-    c.execute("UPDATE user_accounts SET expenses_role=COALESCE(NULLIF(TRIM(expenses_role),''),'view')")
-    c.execute("UPDATE user_accounts SET plans_role=COALESCE(NULLIF(TRIM(plans_role),''),'view')")
+    # Default non-admin member roles to edit so members can manage their own data.
+    c.execute("UPDATE user_accounts SET budget_role=COALESCE(NULLIF(TRIM(budget_role),''),'edit')")
+    c.execute("UPDATE user_accounts SET expenses_role=COALESCE(NULLIF(TRIM(expenses_role),''),'edit')")
+    c.execute("UPDATE user_accounts SET plans_role=COALESCE(NULLIF(TRIM(plans_role),''),'edit')")
+    # Ensure admins have full edit rights.
     c.execute("UPDATE user_accounts SET budget_role='edit', expenses_role='edit', plans_role='edit' WHERE is_admin=1")
 
     # Allow multiple accounts to belong to the same family (member).
@@ -218,7 +220,7 @@ def init(c):
         urow = c.execute("SELECT id FROM user_accounts WHERE username=?", (admin_username,)).fetchone()
         if urow:
             c.execute(
-                "UPDATE user_accounts SET is_admin=1, budget_role='edit', expenses_role='edit', plans_role='edit' WHERE id=?",
+                "UPDATE user_accounts SET is_admin=1, is_global_admin=1, budget_role='edit', expenses_role='edit', plans_role='edit' WHERE id= ?",
                 (int(urow[0]),),
             )
         else:
@@ -227,6 +229,9 @@ def init(c):
                 "INSERT INTO user_accounts(member_id,username,password_hash,is_admin,is_global_admin,budget_role,expenses_role,plans_role,created_at,last_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (member_id, admin_username, pwh, 1, 1, "edit", "edit", "edit", now, None),
             )
+
+    # Also ensure the default "admin" account is always a global admin.
+    c.execute("UPDATE user_accounts SET is_global_admin=1 WHERE username='admin'")
 
     c.commit()
 
@@ -393,9 +398,9 @@ def auth_get(c):
         "member_id": int(row[2]),
         "is_admin": int(row[3]) == 1,
         "is_global_admin": int(row[4]) == 1,
-        "budget_role": (row[5] or "view"),
-        "expenses_role": (row[6] or "view"),
-        "plans_role": (row[7] or "view"),
+        "budget_role": (row[5] or "edit"),
+        "expenses_role": (row[6] or "edit"),
+        "plans_role": (row[7] or "edit"),
         "member_name": row[8],
     }
 
@@ -439,12 +444,14 @@ def module_role(auth, module):
     if auth.get("is_global_admin") or auth.get("is_admin"):
         return "edit"
 
-    # Members should be able to manage their own budget/expenses/plans.
-    # Fall back to stored role if explicitly set (e.g. "view"), otherwise default to edit.
-    role = auth.get(f"{module}_role")
-    if role in ["none", "view", "edit"]:
-        return role
-    return "edit"
+    # For budget/expenses/plans, members should be able to edit by default.
+    # Only a role explicitly set to "none" blocks access.
+    if module in ["budget", "expenses", "plans"]:
+        role = (auth.get(f"{module}_role") or "").strip().lower()
+        return "none" if role == "none" else "edit"
+
+    # For other modules, use the stored role (defaults to view for safety).
+    return _norm_role(auth.get(f"{module}_role"))
 
 
 def can_view(auth, module):
@@ -663,10 +670,11 @@ def tooltip(label, text):
 
 def apply_apex_filters(df, key_prefix, hidden_cols=None):
     hidden_cols = hidden_cols or []
-    if df.empty:
-        return df, False
     cols = [c for c in df.columns if c not in hidden_cols]
-    with st.expander("Filters (APEX Style)", expanded=False):
+    with st.expander("Filters", expanded=False):
+        if df.empty:
+            st.info("No rows found; filters are available once data is present.")
+            return df, False
         qtext = st.text_input("Row Search (all columns)", key=f"{key_prefix}_row_search")
         selected_cols = st.multiselect(
             "Column Filters",
@@ -1240,7 +1248,7 @@ def grid_budget(c, s, auth):
             bi.id,
             bi.category,
             bi.allocated_amount,
-            m.name AS member,
+            m.name AS family,
             bi.notes,
             bi.member_id,
             bi.owner_member_id
@@ -1252,7 +1260,7 @@ def grid_budget(c, s, auth):
         (auth["member_id"],),
     )
     if df.empty:
-        df = pd.DataFrame(columns=['id', 'category', 'allocated_amount', 'member', 'notes', 'member_id', 'owner_member_id'])
+        df = pd.DataFrame(columns=['id', 'category', 'allocated_amount', 'family', 'notes', 'member_id', 'owner_member_id'])
 
     if not can_edit(auth, "budget"):
         grid_df, _ = apply_apex_filters(df.drop(columns=["member_id", "owner_member_id"], errors="ignore"), "budget_ro", hidden_cols=["id"])
@@ -1262,23 +1270,31 @@ def grid_budget(c, s, auth):
 
     with st.expander("Budget Editor", expanded=True):
         st.markdown("#### Budget Grid")
+        st.markdown("**Required:** <span style='color:red;'>*</span> Category, Allocated amount, Family", unsafe_allow_html=True)
         st.caption("Edit budget lines and allocations. Use the filters to drill into specific categories or members.")
         grid_df, filtered_mode = apply_apex_filters(df, "budget", hidden_cols=["id", "member_id", "owner_member_id"])
+        # Show family instead of member; default to current family for non-global admins.
+        family_options = names if auth.get('is_global_admin') else [auth['member_name']]
         col_cfg = {
             'id': None,
             'member_id': None,
             'owner_member_id': None,
             'category': st.column_config.SelectboxColumn(options=cts, help="Category for this budget item."),
-            'member': st.column_config.SelectboxColumn(options=names, help="Who the budget item is for."),
+            'family': st.column_config.SelectboxColumn(options=family_options, help="Which family this budget item is for."),
         }
+        grid_df['family'] = grid_df['family'].fillna(auth['member_name'])
         ed = st.data_editor(grid_df, num_rows='dynamic', use_container_width=True, key='bgrid', column_config=col_cfg)
         if st.button('Save Budget Grid'):
             ed2 = ed.copy()
-            ed2["member_id"] = ed2["member"]
-            ed2["owner_member_id"] = auth["member_id"]
+            # Always enforce the correct family selection for non-global admins.
+            if not auth.get('is_global_admin'):
+                ed2['family'] = auth['member_name']
+            ed2['member_id'] = ed2['family']
+            ed2['owner_member_id'] = auth['member_id']
             ok = upsert_grid(c, 'budget_items', ed2, ['category', 'member_id', 'allocated_amount', 'notes', 'owner_member_id'], [
-                lambda r: 'Budget category invalid' if r.get('category') not in cts else None,
-                lambda r: 'Budget member required' if not r.get('member_id') else None,
+                lambda r: 'Budget category required' if not r.get('category') else None,
+                lambda r: 'Family required' if not r.get('member_id') else None,
+                lambda r: 'Allocated amount required' if r.get('allocated_amount') in [None, '', 0] else None,
                 lambda r: 'Allocated amount must be > 0' if float(r.get('allocated_amount') or 0) <= 0 else None,
                 lambda r: 'Owner required' if not r.get('owner_member_id') else None,
             ], map_in={'member_id': mm}, delete_missing=not filtered_mode)
@@ -1314,15 +1330,17 @@ def grid_expenses(c, s, auth):
             e.bill_link,
             e.email_ref,
             e.notes,
-            e.owner_member_id
+            e.owner_member_id,
+            m.name AS family
         FROM expenses e
+        LEFT JOIN members m ON m.id = e.owner_member_id
         WHERE e.owner_member_id=?
         ORDER BY e.expense_date DESC, e.id DESC
         """,
         (auth["member_id"],),
     )
     if df.empty:
-        df = pd.DataFrame(columns=['id', 'expense_date', 'title', 'category', 'amount', 'paid_by', 'status', 'bill_link', 'email_ref', 'notes', 'owner_member_id'])
+        df = pd.DataFrame(columns=['id', 'expense_date', 'title', 'category', 'amount', 'paid_by', 'status', 'bill_link', 'email_ref', 'notes', 'owner_member_id', 'family'])
     else:
         status_counts = df['status'].astype(str).str.lower().value_counts()
         st.markdown(
@@ -1377,6 +1395,7 @@ def grid_expenses(c, s, auth):
         return
     with st.expander("Expense Editor", expanded=True):
         st.markdown("#### Expenses Grid")
+        st.markdown("**Required:** <span style='color:red;'>*</span> Date, Title, Category, Amount, Paid by, Status", unsafe_allow_html=True)
         st.caption("Edit and track expenses. Use filters to narrow down to specific dates, categories, or status.")
         grid_df, filtered_mode = apply_apex_filters(df, "expenses", hidden_cols=["id", "owner_member_id", "overdue"])
         col_cfg = {
@@ -1389,17 +1408,23 @@ def grid_expenses(c, s, auth):
         }
         ed = st.data_editor(grid_df, num_rows='dynamic', use_container_width=True, key='egrid', column_config=col_cfg)
         def v1(r): return 'Expense title required' if not r.get('title') else None
-        def v2(r): return 'Expense category invalid' if r.get('category') not in cts else None
-        def v3(r): return 'Expense amount must be > 0' if float(r.get('amount') or 0) <= 0 else None
+        def v2(r): return 'Expense category required' if not r.get('category') else None
+        def v3(r):
+            if r.get('amount') in [None, '', 0]:
+                return 'Expense amount required'
+            return 'Expense amount must be > 0' if float(r.get('amount') or 0) <= 0 else None
         def v4(r):
             vals = r.get('paid_by') if isinstance(r.get('paid_by'), list) else ([r.get('paid_by')] if r.get('paid_by') else [])
             if not vals:
-                return 'Paid By requires at least one person'
+                return 'Paid By required'
             for v in vals:
                 if v not in mm:
                     return 'Paid By invalid'
             return None
-        def v5(r): return 'Status invalid' if r.get('status') not in ['Paid', 'Pending'] else None
+        def v5(r):
+            if not r.get('status'):
+                return 'Status required'
+            return 'Status invalid' if r.get('status') not in ['Paid', 'Pending'] else None
         def v6(r):
             if blank(r.get('expense_date')): return 'Expense date required'
             if pd.isna(pd.to_datetime(r.get('expense_date'), errors='coerce')): return 'Expense date invalid'
@@ -1680,16 +1705,18 @@ def grid_plans(c, s, auth):
             p.estimated_cost,
             p.notes,
             p.assigned_to AS assigned_to_id,
-            p.owner_member_id
+            p.owner_member_id,
+            o.name AS family
         FROM plans p
         LEFT JOIN members m ON m.id=p.assigned_to
+        LEFT JOIN members o ON o.id=p.owner_member_id
         WHERE p.owner_member_id=?
         ORDER BY p.due_date,p.id DESC
         """,
         (auth["member_id"],),
     )
     if df.empty:
-        df = pd.DataFrame(columns=['id', 'item_type', 'title', 'due_date', 'assigned_to', 'status', 'estimated_cost', 'notes'])
+        df = pd.DataFrame(columns=['id', 'item_type', 'title', 'due_date', 'assigned_to', 'status', 'estimated_cost', 'notes', 'family'])
     else:
         df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce')
 
@@ -1701,6 +1728,7 @@ def grid_plans(c, s, auth):
 
     with st.expander("Planning Editor", expanded=True):
         st.markdown("#### Planning Grid")
+        st.markdown("**Required:** <span style='color:red;'>*</span> Item Type, Title, Status", unsafe_allow_html=True)
         st.caption("Create tasks, assign family members, and track progress as you plan.")
         grid_df, filtered_mode = apply_apex_filters(df, "plans", hidden_cols=["id", "assigned_to_id", "owner_member_id"])
         col_cfg = {
@@ -1719,9 +1747,11 @@ def grid_plans(c, s, auth):
             ed2['due_date'] = pd.to_datetime(ed2['due_date'], errors='coerce').dt.date.astype(str).replace('NaT', None)
             ed2["owner_member_id"] = auth["member_id"]
             ok = upsert_grid(c, 'plans', ed2, ['item_type', 'title', 'due_date', 'assigned_to', 'status', 'estimated_cost', 'notes', 'owner_member_id'], [
-                lambda r: 'Planning type invalid' if r.get('item_type') not in cts else None,
+                lambda r: 'Planning type required' if not r.get('item_type') else None,
+                lambda r: 'Planning type invalid' if r.get('item_type') and r.get('item_type') not in cts else None,
                 lambda r: 'Planning title required' if not r.get('title') else None,
-                lambda r: 'Planning status invalid' if r.get('status') not in ['Not Started', 'In Progress', 'Done'] else None,
+                lambda r: 'Planning status required' if not r.get('status') else None,
+                lambda r: 'Planning status invalid' if r.get('status') and r.get('status') not in ['Not Started', 'In Progress', 'Done'] else None,
                 lambda r: 'Estimated cost cannot be negative' if float(r.get('estimated_cost') or 0) < 0 else None,
                 lambda r: 'Assigned to invalid' if r.get('assigned_to') and r.get('assigned_to') not in mm else None,
                 lambda r: 'Owner required' if not r.get('owner_member_id') else None,
