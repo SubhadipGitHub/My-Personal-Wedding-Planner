@@ -1,2 +1,3 @@
 .venv
 wedding_planner.db
+__pycache__/
