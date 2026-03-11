@@ -13,8 +13,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-DB_PATH = Path('wedding_planner.db')
-SESSION_STATE_FILE = Path('.streamlit_login.json')
+# Store the database alongside the app file so it is created in a consistent location
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / 'wedding_planner.db'
+SESSION_STATE_FILE = APP_DIR / '.streamlit_login.json'
 SETTINGS_DEFAULTS = {
     'currency_symbol': 'Rs ', 'currency_code': 'INR', 'timezone': 'Asia/Kolkata',
     'date_format': '%d-%b-%Y', 'user_name': 'Me', 'partner_name': 'Partner',
@@ -25,6 +27,8 @@ st.set_page_config(page_title='Wedding Planner', page_icon=':ring:', layout='wid
 
 
 def db():
+    # Ensure the directory exists (important for some deployment environments).
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.execute('PRAGMA foreign_keys = ON')
     return c
