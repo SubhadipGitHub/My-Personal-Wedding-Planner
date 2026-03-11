@@ -983,33 +983,41 @@ def grid_family(c, auth):
     is_family_admin = bool(auth.get("is_admin"))
     is_global_admin = bool(auth.get("is_global_admin"))
 
-    st.markdown("#### Family Grid")
-    st.caption("Add or remove families here. Each family can have multiple user accounts and its own budget/expense data.")
     df = q(c, 'SELECT id,name FROM members ORDER BY name')
     if df.empty:
         df = pd.DataFrame(columns=['id', 'name'])
     id_to_name = {int(r['id']): r['name'] for _, r in df.iterrows()}
 
-    grid_df, filtered_mode = apply_apex_filters(df, "family", hidden_cols=["id"])
-    ed = st.data_editor(
-        grid_df,
-        num_rows='dynamic',
-        use_container_width=True,
-        key='mgrid',
-        column_config={'id': None},
-    )
-    if st.button('Save Family Grid'):
-        ok = upsert_grid(
-            c,
-            'members',
-            ed,
-            ['name'],
-            [lambda r: 'Name required' if not r.get('name') else None],
-            delete_missing=not filtered_mode,
+    if is_global_admin:
+        st.markdown("#### Family Grid")
+        st.caption("Add or remove families here. Each family can have multiple user accounts and its own budget/expense data.")
+        grid_df, filtered_mode = apply_apex_filters(df, "family", hidden_cols=["id"])
+        ed = st.data_editor(
+            grid_df,
+            num_rows='dynamic',
+            use_container_width=True,
+            key='mgrid',
+            column_config={'id': None},
         )
-        if ok:
-            st.success('Saved')
-            st.rerun()
+        if st.button('Save Family Grid'):
+            ok = upsert_grid(
+                c,
+                'members',
+                ed,
+                ['name'],
+                [lambda r: 'Name required' if not r.get('name') else None],
+                delete_missing=not filtered_mode,
+            )
+            if ok:
+                st.success('Saved')
+                st.rerun()
+    else:
+        st.markdown("#### Your Family (read-only)")
+        st.caption("Only global admins can add or remove families.")
+        df = q(c, "SELECT id,name FROM members WHERE id=? ORDER BY name", (auth["member_id"],))
+        if df.empty:
+            df = pd.DataFrame(columns=["id", "name"])
+        st.dataframe(df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
 
     # If not family admin, allow viewing only your own family.
     if not is_family_admin:
