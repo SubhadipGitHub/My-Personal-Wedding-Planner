@@ -16,7 +16,6 @@ import streamlit as st
 # Store the database alongside the app file so it is created in a consistent location
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / 'wedding_planner.db'
-SESSION_STATE_FILE = APP_DIR / '.streamlit_login.json'
 SETTINGS_DEFAULTS = {
     'currency_symbol': 'Rs ', 'currency_code': 'INR', 'timezone': 'Asia/Kolkata',
     'date_format': '%d-%b-%Y', 'user_name': 'Me', 'partner_name': 'Partner',
@@ -53,21 +52,18 @@ def init(c):
         last_login TEXT,
         FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE
     );
-    CREATE TABLE IF NOT EXISTS access_grants(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        viewer_member_id INTEGER NOT NULL,
-        target_member_id INTEGER NOT NULL,
-        scope TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(viewer_member_id, target_member_id, scope),
-        FOREIGN KEY(viewer_member_id) REFERENCES members(id) ON DELETE CASCADE,
-        FOREIGN KEY(target_member_id) REFERENCES members(id) ON DELETE CASCADE
-    );
     CREATE TABLE IF NOT EXISTS budget_items(id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, allocated_amount REAL NOT NULL, notes TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY AUTOINCREMENT, expense_date TEXT NOT NULL, title TEXT NOT NULL, category TEXT NOT NULL, amount REAL NOT NULL, paid_by INTEGER, for_whom INTEGER, status TEXT NOT NULL, bill_link TEXT, email_ref TEXT, notes TEXT, created_at TEXT NOT NULL, FOREIGN KEY(paid_by) REFERENCES members(id) ON DELETE SET NULL, FOREIGN KEY(for_whom) REFERENCES members(id) ON DELETE SET NULL);
     CREATE TABLE IF NOT EXISTS expense_allocations(id INTEGER PRIMARY KEY AUTOINCREMENT, expense_id INTEGER NOT NULL, member_id INTEGER, allocated_amount REAL NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(expense_id) REFERENCES expenses(id) ON DELETE CASCADE, FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE SET NULL);
     CREATE TABLE IF NOT EXISTS expense_people(id INTEGER PRIMARY KEY AUTOINCREMENT, expense_id INTEGER NOT NULL, member_id INTEGER NOT NULL, relation_type TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(expense_id) REFERENCES expenses(id) ON DELETE CASCADE, FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS plans(id INTEGER PRIMARY KEY AUTOINCREMENT, item_type TEXT NOT NULL, title TEXT NOT NULL, due_date TEXT, assigned_to INTEGER, status TEXT NOT NULL, estimated_cost REAL, notes TEXT, created_at TEXT NOT NULL, FOREIGN KEY(assigned_to) REFERENCES members(id) ON DELETE SET NULL);
+    CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+    );
     ''')
     ua_cols = {r[1] for r in c.execute("PRAGMA table_info(user_accounts)").fetchall()}
     if "is_admin" not in ua_cols:
@@ -122,6 +118,16 @@ def init(c):
                 break
 
     budget_cols = {r[1] for r in c.execute("PRAGMA table_info(budget_items)").fetchall()}
+    if "member_id" not in budget_cols:
+        c.execute("ALTER TABLE budget_items ADD COLUMN member_id INTEGER")
+        budget_cols.add("member_id")
+    c.execute(
+        """
+        UPDATE budget_items
+        SET member_id = (SELECT id FROM members ORDER BY id LIMIT 1)
+        WHERE member_id IS NULL
+        """
+    )
     if "owner_member_id" not in budget_cols:
         c.execute("ALTER TABLE budget_items ADD COLUMN owner_member_id INTEGER")
     c.execute(
@@ -165,16 +171,6 @@ def init(c):
     if "due_date" not in exp_cols:
         c.execute("ALTER TABLE expenses ADD COLUMN due_date TEXT")
     c.execute("UPDATE expenses SET due_date=expense_date WHERE due_date IS NULL OR TRIM(due_date)=''")
-    budget_cols = {r[1] for r in c.execute("PRAGMA table_info(budget_items)").fetchall()}
-    if "member_id" not in budget_cols:
-        c.execute("ALTER TABLE budget_items ADD COLUMN member_id INTEGER")
-    c.execute(
-        """
-        UPDATE budget_items
-        SET member_id = (SELECT id FROM members ORDER BY id LIMIT 1)
-        WHERE member_id IS NULL
-        """
-    )
     # backfill legacy single-value paid_by/for_whom into expense_people
     c.execute(
         """
@@ -201,14 +197,18 @@ def init(c):
         """
     )
 
-    # Ensure there is always at least one global admin account.
-    # If no admin exists, create (or promote) the default admin user "admin".
+    # Recovery only: if accounts already exist but somehow none is an admin
+    # (e.g. the last admin was demoted/deleted), restore one with a random
+    # one-time password. On a genuinely fresh install (no accounts at all),
+    # do nothing here -- the interactive first-run "Create Admin" form in
+    # login_sidebar() handles that case with a password the operator chooses.
     admin_exists = c.execute("SELECT 1 FROM user_accounts WHERE is_admin=1 LIMIT 1").fetchone()
-    if not admin_exists:
+    has_any_account = c.execute("SELECT 1 FROM user_accounts LIMIT 1").fetchone()
+    if not admin_exists and has_any_account:
         now = datetime.now().isoformat(timespec='seconds')
         member_name = "Admin"
         admin_username = "admin"
-        admin_password = "Welcome@12345"
+        admin_password = _random_temp_password()
 
         mrow = c.execute("SELECT id FROM members WHERE name=?", (member_name,)).fetchone()
         if mrow:
@@ -221,9 +221,10 @@ def init(c):
 
         urow = c.execute("SELECT id FROM user_accounts WHERE username=?", (admin_username,)).fetchone()
         if urow:
+            pwh = hash_password(admin_password)
             c.execute(
-                "UPDATE user_accounts SET is_admin=1, is_global_admin=1, budget_role='edit', expenses_role='edit', plans_role='edit' WHERE id= ?",
-                (int(urow[0]),),
+                "UPDATE user_accounts SET password_hash=?, is_admin=1, is_global_admin=1, budget_role='edit', expenses_role='edit', plans_role='edit' WHERE id=?",
+                (pwh, int(urow[0])),
             )
         else:
             pwh = hash_password(admin_password)
@@ -231,9 +232,13 @@ def init(c):
                 "INSERT INTO user_accounts(member_id,username,password_hash,is_admin,is_global_admin,budget_role,expenses_role,plans_role,created_at,last_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (member_id, admin_username, pwh, 1, 1, "edit", "edit", "edit", now, None),
             )
+        print(
+            f"[wedding-planner] No admin account was found. Recovered admin account "
+            f"'{admin_username}' with one-time password: {admin_password}\n"
+            f"[wedding-planner] Log in and change this password immediately."
+        )
 
-    # Also ensure the default "admin" account is always a global admin.
-    c.execute("UPDATE user_accounts SET is_global_admin=1 WHERE username='admin'")
+    c.execute("DELETE FROM sessions WHERE expires_at < ?", (datetime.now().isoformat(timespec='seconds'),))
 
     c.commit()
 
@@ -273,8 +278,8 @@ def _pbkdf2_hash(password, salt, iterations=210_000):
 
 def hash_password(password):
     password = (password or "").strip()
-    if len(password) < 6:
-        raise ValueError("Password must be at least 6 characters.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
     iterations = 210_000
     salt = secrets.token_bytes(16)
     digest = _pbkdf2_hash(password, salt, iterations)
@@ -299,87 +304,95 @@ def verify_password(stored, password):
         return False
 
 
-def create_password_reset_token(c, username, expires_minutes=60):
-    username = (username or "").strip()
-    if not username:
-        return None
-    token = secrets.token_urlsafe(24)
-    expires_at = (datetime.now() + timedelta(minutes=expires_minutes)).isoformat(timespec="seconds")
-    cur = c.execute(
-        "UPDATE user_accounts SET reset_token=?, reset_expires_at=? WHERE username=?",
-        (token, expires_at, username),
+SESSION_TTL_DAYS = 30
+
+
+def _get_query_param(name):
+    if hasattr(st, "query_params"):
+        try:
+            return st.query_params.get(name)
+        except Exception:
+            return None
+    params = st.experimental_get_query_params()
+    vals = params.get(name)
+    return vals[0] if vals else None
+
+
+def _set_query_param(name, value):
+    if hasattr(st, "query_params"):
+        st.query_params[name] = value
+    else:
+        params = st.experimental_get_query_params()
+        params[name] = value
+        st.experimental_set_query_params(**params)
+
+
+def _clear_query_param(name):
+    if hasattr(st, "query_params"):
+        try:
+            del st.query_params[name]
+        except KeyError:
+            pass
+    else:
+        params = st.experimental_get_query_params()
+        params.pop(name, None)
+        st.experimental_set_query_params(**params)
+
+
+def create_session(c, user_id):
+    """Create a server-side session row and return its token.
+
+    Storing the token in the URL (rather than a shared file) keeps each
+    browser tab's login isolated to that tab -- a previous global-file
+    approach let any new session silently inherit the last logged-in user.
+    """
+    token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    expires_at = (now + timedelta(days=SESSION_TTL_DAYS)).isoformat(timespec='seconds')
+    c.execute(
+        "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+        (token, int(user_id), now.isoformat(timespec='seconds'), expires_at),
     )
-    if cur.rowcount == 0:
-        return None
     c.commit()
     return token
 
 
-def reset_password_with_token(c, token, new_password):
-    token = (token or "").strip()
-    if not token:
-        return False, "Invalid token."
-    row = c.execute(
-        "SELECT id, reset_expires_at FROM user_accounts WHERE reset_token=?",
-        (token,),
-    ).fetchone()
-    if not row:
-        return False, "Invalid token."
-    uid, expires_at = row
-    if not expires_at:
-        return False, "Invalid token."
-    try:
-        expires_dt = datetime.fromisoformat(expires_at)
-    except Exception:
-        return False, "Invalid token."
-    if expires_dt < datetime.now():
-        return False, "Token has expired."
-    try:
-        pwh = hash_password(new_password)
-    except ValueError as e:
-        return False, str(e)
-    c.execute(
-        "UPDATE user_accounts SET password_hash=?, reset_token=NULL, reset_expires_at=NULL WHERE id=?",
-        (pwh, uid),
-    )
-    c.commit()
-    return True, None
+def destroy_session(c, token):
+    if token:
+        c.execute("DELETE FROM sessions WHERE token=?", (token,))
+        c.commit()
 
 
-def _persist_auth_uid(uid: int | None):
-    """Persist the current logged-in user for reloads/refreshes."""
-    try:
-        if uid is None:
-            if SESSION_STATE_FILE.exists():
-                SESSION_STATE_FILE.unlink()
-            return
-        SESSION_STATE_FILE.write_text(str(int(uid)))
-    except Exception:
-        pass
+def _login_as(c, user_id):
+    token = create_session(c, user_id)
+    st.session_state["auth_user_id"] = int(user_id)
+    st.session_state["auth_token"] = token
+    _set_query_param("session", token)
 
 
-def _load_persisted_auth_uid():
-    if not SESSION_STATE_FILE.exists():
-        return None
-    try:
-        return int(SESSION_STATE_FILE.read_text().strip())
-    except Exception:
-        return None
-
-
-def auth_clear():
-    for k in ["auth_user_id"]:
-        if k in st.session_state:
-            del st.session_state[k]
-    _persist_auth_uid(None)
+def auth_clear(c):
+    token = st.session_state.get("auth_token")
+    destroy_session(c, token)
+    for k in ["auth_user_id", "auth_token"]:
+        st.session_state.pop(k, None)
+    _clear_query_param("session")
 
 
 def auth_get(c):
     uid = st.session_state.get("auth_user_id")
     if not uid:
-        uid = _load_persisted_auth_uid()
-        if uid:
-            st.session_state["auth_user_id"] = uid
+        token = _get_query_param("session")
+        if token:
+            row = c.execute("SELECT user_id, expires_at FROM sessions WHERE token=?", (token,)).fetchone()
+            valid = row and row[1] and datetime.fromisoformat(row[1]) > datetime.now()
+            if valid:
+                uid = int(row[0])
+                st.session_state["auth_user_id"] = uid
+                st.session_state["auth_token"] = token
+            else:
+                if row:
+                    destroy_session(c, token)
+                _clear_query_param("session")
     if not uid:
         return None
     row = c.execute(
@@ -392,7 +405,7 @@ def auth_get(c):
         (int(uid),),
     ).fetchone()
     if not row:
-        auth_clear()
+        auth_clear(c)
         return None
     return {
         "user_id": int(row[0]),
@@ -405,33 +418,6 @@ def auth_get(c):
         "plans_role": (row[7] or "edit"),
         "member_name": row[8],
     }
-
-
-def allowed_member_ids(c, auth, scope):
-    if not auth:
-        return set()
-    # Global admins can access all families.
-    if auth.get("is_global_admin"):
-        rows = c.execute("SELECT id FROM members").fetchall()
-        return {int(r[0]) for r in rows}
-    # Family admins can only access their own family (and any additional families explicitly granted).
-    if auth.get("is_admin"):
-        return {int(auth["member_id"])}
-    viewer = int(auth["member_id"])
-    scope = (scope or "").strip().lower()
-    allowed_scopes = [scope, "all"]
-    rows = c.execute(
-        """
-        SELECT target_member_id
-        FROM access_grants
-        WHERE viewer_member_id=?
-        AND lower(scope) IN ({})
-        """.format(",".join(["?"] * len(allowed_scopes))),
-        (viewer, *allowed_scopes),
-    ).fetchall()
-    out = {viewer}
-    out.update({int(r[0]) for r in rows})
-    return out
 
 
 def _norm_role(role):
@@ -471,23 +457,6 @@ def _in_params(vals):
     return "({})".format(",".join(["?"] * len(vals))), tuple(vals)
 
 
-def visible_expense_ids(c, allowed_ids):
-    clause, params = _in_params(allowed_ids)
-    rows = c.execute(
-        f"""
-        SELECT DISTINCT e.id
-        FROM expenses e
-        LEFT JOIN expense_people ep
-            ON ep.expense_id=e.id AND ep.relation_type='paid_by'
-        LEFT JOIN expense_allocations ea
-            ON ea.expense_id=e.id
-        WHERE (ep.member_id IN {clause} OR ea.member_id IN {clause})
-        """,
-        (*params, *params),
-    ).fetchall()
-    return {int(r[0]) for r in rows}
-
-
 def _username_base_from_name(name):
     # Lowercase, keep alnum, convert whitespace to dots, collapse repeats.
     s = (name or "").strip().lower()
@@ -523,7 +492,7 @@ def login_sidebar(c):
         st.sidebar.write(f"Signed in as: **{auth['username']}**")
         st.sidebar.caption(f"Member: {auth['member_name']} | Admin: {'Yes' if auth['is_admin'] else 'No'}")
         if st.sidebar.button("Logout"):
-            auth_clear()
+            auth_clear(c)
             st.rerun()
         return auth
 
@@ -532,8 +501,8 @@ def login_sidebar(c):
         with st.sidebar.form("setup_admin"):
             member_name = st.text_input("Admin profile name", value="Admin", help="This is the family name for the admin account.")
             username = st.text_input("Admin username", value="admin", help="This is the login username for the admin account.")
-            password = st.text_input("Admin password", type="password", value="Welcome@12345", disabled=True)
-            st.markdown("*The admin password is fixed to **Welcome@12345**.*")
+            password = st.text_input("Admin password", type="password", help="Minimum 8 characters.")
+            confirm_password = st.text_input("Confirm admin password", type="password")
             ok = st.form_submit_button("Create Admin")
         if ok:
             member_name = (member_name or "").strip()
@@ -546,6 +515,9 @@ def login_sidebar(c):
                 return None
             if not (password or "").strip():
                 st.sidebar.error("Admin password is required.")
+                return None
+            if password != confirm_password:
+                st.sidebar.error("Passwords do not match.")
                 return None
             try:
                 pwh = hash_password(password)
@@ -565,14 +537,13 @@ def login_sidebar(c):
                     member_id = int(inserted_m.lastrowid)
                 curx = c.execute(
                     "INSERT INTO user_accounts(member_id,username,password_hash,is_admin,is_global_admin,budget_role,expenses_role,plans_role,created_at,last_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (member_id, username, pwh, 1, 0, "edit", "edit", "edit", now, None),
+                    (member_id, username, pwh, 1, 1, "edit", "edit", "edit", now, None),
                 )
                 c.commit()
             except sqlite3.IntegrityError:
                 st.sidebar.error("Username already exists or that member already has an account.")
                 return None
-            st.session_state["auth_user_id"] = int(curx.lastrowid)
-            _persist_auth_uid(int(curx.lastrowid))
+            _login_as(c, curx.lastrowid)
             st.rerun()
         return None
 
@@ -593,41 +564,10 @@ def login_sidebar(c):
         now = datetime.now().isoformat(timespec='seconds')
         c.execute("UPDATE user_accounts SET last_login=? WHERE id=?", (now, int(row[0])))
         c.commit()
-        st.session_state["auth_user_id"] = int(row[0])
-        _persist_auth_uid(int(row[0]))
+        _login_as(c, row[0])
         st.rerun()
 
-    with st.sidebar.expander("Forgot password?", expanded=False):
-        st.markdown(
-            "Enter your username to generate a reset token (valid for 1 hour). "
-            "Then use that token below to set a new password."
-        )
-        with st.form("forgot_password_request"):
-            fp_username = st.text_input("Username", key="fp_username", help="Your login username")
-            fp_ok = st.form_submit_button("Generate reset token")
-        if fp_ok:
-            token = create_password_reset_token(c, fp_username)
-            if not token:
-                st.error("No account found with that username.")
-            else:
-                st.success("Reset token generated. Keep it safe and use it to reset your password below.")
-                st.code(token)
-
-        st.markdown("---")
-        with st.form("forgot_password_reset"):
-            fp_token = st.text_input("Reset token", key="fp_token", help="Paste the token you received above.")
-            new_password = st.text_input("New password", type="password", key="fp_new_password", help="Minimum 6 characters.")
-            confirm_password = st.text_input("Confirm new password", type="password", key="fp_confirm_password")
-            fp_reset_ok = st.form_submit_button("Reset password")
-        if fp_reset_ok:
-            if new_password != confirm_password:
-                st.error("Passwords do not match.")
-            else:
-                ok, msg = reset_password_with_token(c, fp_token, new_password)
-                if not ok:
-                    st.error(msg)
-                else:
-                    st.success("Password has been reset. You can now log in with your new password.")
+    st.sidebar.caption("Forgot your password? Ask your family or global admin to reset it from the Family tab.")
 
     return None
 
@@ -1782,165 +1722,6 @@ def grid_plans(c, s, auth):
                 st.rerun()
 
 
-def admin_panel(c, auth):
-    if not auth or not auth.get("is_admin"):
-        st.info("Admin panel is admin-only.")
-        return
-
-    st.subheader("Family Admin")
-
-    st.markdown("#### Family User Accounts")
-    ua = q(
-        c,
-        """
-        SELECT ua.id, m.name AS family, ua.username, ua.is_admin, ua.created_at, ua.last_login
-        FROM user_accounts ua
-        JOIN members m ON m.id=ua.member_id
-        WHERE ua.member_id=?
-        ORDER BY ua.username
-        """,
-        (auth["member_id"],),
-    )
-    if ua.empty:
-        ua = pd.DataFrame(columns=["id", "family", "username", "is_admin", "created_at", "last_login"])
-
-    family_has_admin = bool((ua["is_admin"] == 1).any()) if not ua.empty else False
-
-    membership = ua[["username", "is_admin", "created_at", "last_login"]].copy()
-    membership["role"] = membership["is_admin"].apply(lambda v: "Admin" if int(v) == 1 else "Member")
-    membership["created_at"] = pd.to_datetime(membership["created_at"], errors="coerce")
-    membership["last_login"] = pd.to_datetime(membership["last_login"], errors="coerce")
-    membership = membership[["username", "role", "created_at", "last_login"]]
-
-    st.markdown("#### Family Membership")
-    st.table(membership)
-
-    st.markdown("#### Family Accounts")
-    st.dataframe(ua.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
-
-    missing = q(
-        c,
-        """
-        SELECT m.id AS member_id, m.name AS member
-        FROM members m
-        LEFT JOIN user_accounts ua ON ua.member_id = m.id
-        WHERE ua.id IS NULL
-          AND m.id = ?
-        ORDER BY m.name
-        """,
-        (auth["member_id"],),
-    )
-    if missing.empty:
-        st.caption("All family accounts are created.")
-    else:
-        st.dataframe(missing.drop(columns=["member_id"], errors="ignore"), use_container_width=True, hide_index=True)
-        with st.form("bulk_create_accounts"):
-            pw_len = st.number_input("Temporary password length", min_value=8, max_value=32, value=12, step=1)
-            ok_bulk = st.form_submit_button("Generate Accounts For Missing Family Members")
-        if ok_bulk:
-            now = datetime.now().isoformat(timespec="seconds")
-            created_rows = []
-            for _, r in missing.iterrows():
-                member_id = int(r["member_id"])
-                member_name = str(r["member"])
-                username = _unique_username(c, member_name)
-                temp_pw = _random_temp_password(int(pw_len))
-                pwh = hash_password(temp_pw)
-                try:
-                    c.execute(
-                        "INSERT INTO user_accounts(member_id,username,password_hash,is_admin,created_at) VALUES(?,?,?,?,?)",
-                        (member_id, username, pwh, 0, now),
-                    )
-                    created_rows.append({"member": member_name, "username": username, "temp_password": temp_pw})
-                except sqlite3.IntegrityError:
-                    continue
-            c.commit()
-            if created_rows:
-                st.session_state["generated_creds"] = created_rows
-                st.warning("Temporary passwords are shown once per generation. Store them now and have members change them.")
-                out_df = pd.DataFrame(created_rows)
-                st.dataframe(out_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Download CSV",
-                    data=out_df.to_csv(index=False).encode("utf-8"),
-                    file_name="member_credentials.csv",
-                    mime="text/csv",
-                )
-                st.rerun()
-            else:
-                st.info("No accounts created.")
-
-    family_name = auth.get("member_name")
-    default_admin = not family_has_admin
-    with st.form("ua_form"):
-        st.markdown(f"**Family:** {family_name}")
-        username = st.text_input("Login username", key="ua_username")
-        password = st.text_input("Set password (required for new accounts)", type="password", key="ua_password")
-        is_admin = st.checkbox(
-            "Family admin",
-            value=default_admin,
-            help="The first account created for a family is automatically a Family admin.",
-            key="ua_is_admin",
-        )
-        ok = st.form_submit_button("Create/Update Account")
-    if ok:
-        username = (username or "").strip()
-        if not username:
-            st.error("Login username is required.")
-            return
-        now = datetime.now().isoformat(timespec="seconds")
-        existing = c.execute("SELECT id, member_id, is_admin FROM user_accounts WHERE username=?", (username,)).fetchone()
-
-        if not family_has_admin:
-            is_admin = True
-
-        try:
-            if existing:
-                existing_id, existing_member_id, existing_is_admin = existing
-                if existing_member_id != auth["member_id"]:
-                    st.error("Username already exists in another family.")
-                    return
-
-                # Prevent removing admin from last family admin.
-                if existing_is_admin == 1 and not is_admin and (ua["is_admin"].sum() <= 1):
-                    st.error("Cannot remove admin privileges from the last family admin.")
-                    return
-
-                set_pw = (password or "").strip() != ""
-                if set_pw:
-                    pwh = hash_password(password)
-                    c.execute(
-                        "UPDATE user_accounts SET password_hash=?, is_admin=? WHERE id=?",
-                        (pwh, 1 if is_admin else 0, int(existing_id)),
-                    )
-                else:
-                    c.execute(
-                        "UPDATE user_accounts SET is_admin=? WHERE id=?",
-                        (1 if is_admin else 0, int(existing_id)),
-                    )
-            else:
-                if not (password or "").strip():
-                    st.error("Password is required when creating a new account.")
-                    return
-                pwh = hash_password(password)
-                c.execute(
-                    "INSERT INTO user_accounts(member_id,username,password_hash,is_admin,created_at,last_login) VALUES(?,?,?,?,?,?)",
-                    (auth["member_id"], username.strip(), pwh, 1 if is_admin else 0, now, None),
-                )
-            c.commit()
-        except sqlite3.IntegrityError:
-            st.error("Username already exists.")
-            return
-        except ValueError as e:
-            st.error(str(e))
-            return
-        st.success("Saved user account.")
-        st.rerun()
-
-    st.markdown("#### Access Model")
-    st.caption("All family members can create/edit/delete records for their family. Family admins can promote another account to Family admin.")
-
-
 def render_settings(c, s, auth):
     st.subheader('⚙️ Settings')
     st.caption('Global application settings. Only admin users can change these.')
@@ -1983,7 +1764,7 @@ def render_settings(c, s, auth):
         }
         save_settings(c, ns); st.success('Saved'); s = settings(c)
     st.caption(f"Current: {s['currency_symbol']} | {s['currency_code']} | {s['timezone']} | {s['date_format']}")
-    if st.checkbox('I understand reset deletes budgets, expenses, plans, members') and st.button('Reset All Data', type='secondary'):
+    if st.checkbox('I understand this permanently deletes ALL budgets, expenses, plans, families, and every login account (including mine) for every family') and st.button('Reset All Data', type='secondary'):
         c.execute('DELETE FROM expense_allocations')
         c.execute('DELETE FROM expenses')
         c.execute('DELETE FROM plans')
@@ -1991,7 +1772,7 @@ def render_settings(c, s, auth):
         c.execute('DELETE FROM members')
         c.commit()
         seed(c)
-        auth_clear()
+        auth_clear(c)
         st.success('Reset done')
         st.rerun()
     return s

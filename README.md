@@ -5,7 +5,7 @@ An interactive, local-first wedding planning app built with Streamlit + SQLite.
 ## Key Features
 
 - ✅ User accounts + login (admin + member access)
-- ✅ Password reset flow with expiring reset tokens
+- ✅ Admin-driven password reset (no public self-service reset)
 - ✅ Last login timestamp recorded per user
 - 🧑‍🤝‍🧑 Multi-family support (each “family” is a separate data scope)
 - 🔐 Role-based access controls (global admin, family admin, member)
@@ -127,11 +127,11 @@ This is a local-first app; to deploy publicly you can use any Streamlit hosting 
 
 ### 1) Login & accounts
 
-- On first launch, the app prompts you to create the **admin account** (`admin` / `Welcome@12345`).
+- On first launch, the app prompts you to create the **admin account** with a username and password you choose (minimum 8 characters).
 - Admins can create additional family members and grant them access.
 - Each user can log in with their username and password.
 - The app records **last login time** for every login.
-- Password reset is supported via a token that expires after 1 hour.
+- Forgot your password? A family or global admin can reset it for you from the Family tab.
 
 ### 2) Create Families (Members)
 
